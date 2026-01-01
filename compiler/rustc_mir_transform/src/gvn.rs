@@ -129,24 +129,18 @@ impl<'tcx> crate::MirPass<'tcx> for GVN {
         let ssa = SsaLocals::new(tcx, body, typing_env);
         // Clone dominators because we need them while mutating the body.
         let dominators = body.basic_blocks.dominators().clone();
-        let maybe_loop_headers = loops::maybe_loop_headers(body);
 
         let arena = DroplessArena::default();
         let mut state =
             VnState::new(tcx, body, typing_env, &ssa, dominators, &body.local_decls, &arena);
 
         for local in body.args_iter().filter(|&local| ssa.is_ssa(local)) {
-            let opaque = state.new_opaque(body.local_decls[local].ty);
+            let opaque = state.new_argument(body.local_decls[local].ty);
             state.assign(local, opaque);
         }
 
         let reverse_postorder = body.basic_blocks.reverse_postorder().to_vec();
         for bb in reverse_postorder {
-            // N.B. With loops, reverse postorder cannot produce a valid topological order.
-            // A statement or terminator from inside the loop, that is not processed yet, may have performed an indirect write.
-            if maybe_loop_headers.contains(bb) {
-                state.invalidate_derefs();
-            }
             let data = &mut body.basic_blocks.as_mut_preserves_cfg()[bb];
             state.visit_basic_block_data(bb, data);
         }
@@ -206,6 +200,7 @@ enum Value<'a, 'tcx> {
     /// Used to represent values we know nothing about.
     /// The `usize` is a counter incremented by `new_opaque`.
     Opaque(VnOpaque),
+    Argument(VnOpaque),
     /// Evaluated or unevaluated constant value.
     Constant {
         value: Const<'tcx>,
@@ -243,7 +238,10 @@ enum Value<'a, 'tcx> {
 
     // Extractions.
     /// This is the *value* obtained by projecting another value.
-    Projection(VnIndex, ProjectionElem<VnIndex, ()>),
+    Projection {
+        base: VnIndex,
+        elem: ProjectionElem<VnIndex, ()>,
+    },
     /// Discriminant of the given value.
     Discriminant(VnIndex),
 
@@ -290,7 +288,7 @@ impl<'a, 'tcx> ValueSet<'a, 'tcx> {
         let value = value(VnOpaque);
 
         debug_assert!(match value {
-            Value::Opaque(_) | Value::Address { .. } => true,
+            Value::Opaque(_) | Value::Argument(_) | Value::Address { .. } => true,
             Value::Constant { disambiguator, .. } => disambiguator.is_some(),
             _ => false,
         });
@@ -350,12 +348,6 @@ impl<'a, 'tcx> ValueSet<'a, 'tcx> {
     fn ty(&self, index: VnIndex) -> Ty<'tcx> {
         self.types[index]
     }
-
-    /// Replace the value associated with `index` with an opaque value.
-    #[inline]
-    fn forget(&mut self, index: VnIndex) {
-        self.values[index] = Value::Opaque(VnOpaque);
-    }
 }
 
 struct VnState<'body, 'a, 'tcx> {
@@ -374,8 +366,6 @@ struct VnState<'body, 'a, 'tcx> {
     /// - `Some(None)` are values for which computation has failed;
     /// - `Some(Some(op))` are successful computations.
     evaluated: IndexVec<VnIndex, Option<Option<&'a OpTy<'tcx>>>>,
-    /// Cache the deref values.
-    derefs: Vec<VnIndex>,
     ssa: &'body SsaLocals,
     dominators: Dominators<BasicBlock>,
     reused_locals: DenseBitSet<Local>,
@@ -408,7 +398,6 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             rev_locals: IndexVec::with_capacity(num_values),
             values: ValueSet::new(num_values),
             evaluated: IndexVec::with_capacity(num_values),
-            derefs: Vec::new(),
             ssa,
             dominators,
             reused_locals: DenseBitSet::new_empty(local_decls.len()),
@@ -455,6 +444,13 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         index
     }
 
+    #[instrument(level = "trace", skip(self), ret)]
+    fn new_argument(&mut self, ty: Ty<'tcx>) -> VnIndex {
+        let index = self.insert_unique(ty, Value::Argument);
+        self.evaluated[index] = Some(None);
+        index
+    }
+
     /// Create a new `Value::Address` distinct from all the others.
     #[instrument(level = "trace", skip(self), ret)]
     fn new_pointer(&mut self, place: Place<'tcx>, kind: AddressKind) -> Option<VnIndex> {
@@ -473,6 +469,10 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             projection.next();
             AddressBase::Deref(base)
         } else {
+            // Only propagate the pointer of the SSA local.
+            if !self.ssa.is_ssa(place.local) {
+                return None;
+            }
             AddressBase::Local(place.local)
         };
         // Do not try evaluating inside `Index`, this has been done by `simplify_place_projection`.
@@ -541,18 +541,6 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         self.insert(ty, Value::Aggregate(VariantIdx::ZERO, self.arena.alloc_slice(values)))
     }
 
-    fn insert_deref(&mut self, ty: Ty<'tcx>, value: VnIndex) -> VnIndex {
-        let value = self.insert(ty, Value::Projection(value, ProjectionElem::Deref));
-        self.derefs.push(value);
-        value
-    }
-
-    fn invalidate_derefs(&mut self) {
-        for deref in std::mem::take(&mut self.derefs) {
-            self.values.forget(deref);
-        }
-    }
-
     #[instrument(level = "trace", skip(self), ret)]
     fn eval_to_const_inner(&mut self, value: VnIndex) -> Option<OpTy<'tcx>> {
         use Value::*;
@@ -566,7 +554,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         let op = match self.get(value) {
             _ if ty.is_zst() => ImmTy::uninit(ty).into(),
 
-            Opaque(_) => return None,
+            Opaque(_) | Argument(_) => return None,
             // Keep runtime check constants as symbolic.
             RuntimeChecks(..) => return None,
 
@@ -648,7 +636,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
                 ImmTy::from_immediate(ptr_imm, ty).into()
             }
 
-            Projection(base, elem) => {
+            Projection { base, elem, .. } => {
                 let base = self.eval_to_const(base)?;
                 // `Index` by constants should have been replaced by `ConstantIndex` by
                 // `simplify_place_projection`.
@@ -818,7 +806,13 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
 
                     // An immutable borrow `_x` always points to the same value for the
                     // lifetime of the borrow, so we can merge all instances of `*_x`.
-                    return Some((projection_ty, self.insert_deref(projection_ty.ty, value)));
+                    return Some((
+                        projection_ty,
+                        self.insert(
+                            projection_ty.ty,
+                            Value::Projection { base: value, elem: ProjectionElem::Deref },
+                        ),
+                    ));
                 } else {
                     return None;
                 }
@@ -827,8 +821,8 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             ProjectionElem::Field(f, _) => match self.get(value) {
                 Value::Aggregate(_, fields) => return Some((projection_ty, fields[f.as_usize()])),
                 Value::Union(active, field) if active == f => return Some((projection_ty, field)),
-                Value::Projection(outer_value, ProjectionElem::Downcast(_, read_variant))
-                    if let Value::Aggregate(written_variant, fields) = self.get(outer_value)
+                Value::Projection { base, elem: ProjectionElem::Downcast(_, read_variant) }
+                    if let Value::Aggregate(written_variant, fields) = self.get(base)
                     // This pass is not aware of control-flow, so we do not know whether the
                     // replacement we are doing is actually reachable. We could be in any arm of
                     // ```
@@ -881,7 +875,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             ProjectionElem::UnwrapUnsafeBinder(_) => ProjectionElem::UnwrapUnsafeBinder(()),
         };
 
-        let value = self.insert(projection_ty.ty, Value::Projection(value, proj));
+        let value = self.insert(projection_ty.ty, Value::Projection { base: value, elem: proj });
         Some((projection_ty, value))
     }
 
@@ -1114,11 +1108,14 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         fields: &[VnIndex],
     ) -> Option<VnIndex> {
         let Some(&first_field) = fields.first() else { return None };
-        let Value::Projection(copy_from_value, _) = self.get(first_field) else { return None };
+        let Value::Projection { base: copy_from_value, .. } = self.get(first_field) else {
+            return None;
+        };
 
         // All fields must correspond one-to-one and come from the same aggregate value.
         if fields.iter().enumerate().any(|(index, &v)| {
-            if let Value::Projection(pointer, ProjectionElem::Field(from_index, _)) = self.get(v)
+            if let Value::Projection { base: pointer, elem: ProjectionElem::Field(from_index, _) } =
+                self.get(v)
                 && copy_from_value == pointer
                 && from_index.index() == index
             {
@@ -1130,7 +1127,7 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
         }
 
         let mut copy_from_local_value = copy_from_value;
-        if let Value::Projection(pointer, proj) = self.get(copy_from_value)
+        if let Value::Projection { base: pointer, elem: proj } = self.get(copy_from_value)
             && let ProjectionElem::Downcast(_, read_variant) = proj
         {
             if variant_index == read_variant {
@@ -1139,6 +1136,45 @@ impl<'body, 'a, 'tcx> VnState<'body, 'a, 'tcx> {
             } else {
                 // The copied variant must be identical.
                 return None;
+            }
+        }
+
+        // We can introduce a new dereference if the source value cannot be changed in the body.
+        let mut copy_root = copy_from_local_value;
+        loop {
+            match self.get(copy_root) {
+                Value::Projection { base, .. } => {
+                    copy_root = base;
+                }
+                Value::Address {
+                    base,
+                    projection,
+                    kind: AddressKind::Ref(BorrowKind::Shared),
+                    ..
+                } if projection.iter().all(ProjectionElem::is_stable_offset) => match base {
+                    AddressBase::Local(local) => {
+                        if !self.ssa.is_ssa(local) {
+                            return None;
+                        }
+                        break;
+                    }
+                    AddressBase::Deref(index) => {
+                        copy_root = index;
+                    }
+                },
+                Value::Argument(_) if !self.ty(copy_root).is_mutable_ptr() => {
+                    break;
+                }
+                Value::Opaque(_) => {
+                    let ty = self.ty(copy_root);
+                    if ty.is_fn() || !ty.is_any_ptr() {
+                        break;
+                    }
+                    return None;
+                }
+                _ => {
+                    return None;
+                }
             }
         }
 
@@ -1843,7 +1879,7 @@ impl<'tcx> VnState<'_, '_, 'tcx> {
                 // If we are here, we failed to find a local, and we already have a `Deref`.
                 // Trying to add projections will only result in an ill-formed place.
                 return None;
-            } else if let Value::Projection(pointer, proj) = self.get(index)
+            } else if let Value::Projection { base: pointer, elem: proj } = self.get(index)
                 && (allow_complex_projection || proj.is_stable_offset())
                 && let Some(proj) = self.try_as_place_elem(self.ty(index), proj, loc)
             {
@@ -1873,10 +1909,6 @@ impl<'tcx> MutVisitor<'tcx> for VnState<'_, '_, 'tcx> {
 
     fn visit_place(&mut self, place: &mut Place<'tcx>, context: PlaceContext, location: Location) {
         self.simplify_place_projection(place, location);
-        if context.is_mutating_use() && place.is_indirect() {
-            // Non-local mutation maybe invalidate deref.
-            self.invalidate_derefs();
-        }
         self.super_place(place, context, location);
     }
 
@@ -1893,7 +1925,7 @@ impl<'tcx> MutVisitor<'tcx> for VnState<'_, '_, 'tcx> {
     ) {
         self.simplify_place_projection(lhs, location);
 
-        let value = self.simplify_rvalue(lhs, rvalue, location);
+        let mut value = self.simplify_rvalue(lhs, rvalue, location);
         if let Some(value) = value {
             if let Some(const_) = self.try_as_constant(value) {
                 *rvalue = Rvalue::Use(Operand::Constant(Box::new(const_)));
@@ -1906,14 +1938,30 @@ impl<'tcx> MutVisitor<'tcx> for VnState<'_, '_, 'tcx> {
             }
         }
 
-        if lhs.is_indirect() {
-            // Non-local mutation maybe invalidate deref.
-            self.invalidate_derefs();
+        let rvalue_ty = rvalue.ty(self.local_decls, self.tcx);
+        // DO NOT reason the pointer value if it may point to a non-SSA local.
+        // For instance, we cannot unify two pointers that dereference same local, because they may
+        // have different lifetimes.
+        if rvalue_ty.is_ref()
+            && let Some(index) = value
+        {
+            match self.get(index) {
+                Value::Opaque(_) | Value::Projection { .. } => {
+                    value = None;
+                }
+                Value::Constant { .. } | Value::Address { .. } | Value::Argument(_) => {}
+                Value::RawPtr { .. } | Value::BinaryOp(..) | Value::Cast { .. } => {}
+                Value::Aggregate(..)
+                | Value::Union(..)
+                | Value::Repeat(..)
+                | Value::Discriminant(..)
+                | Value::RuntimeChecks(..)
+                | Value::UnaryOp(..) => unreachable!(),
+            }
         }
 
         if let Some(local) = lhs.as_local()
             && self.ssa.is_ssa(local)
-            && let rvalue_ty = rvalue.ty(self.local_decls, self.tcx)
             // FIXME(#112651) `rvalue` may have a subtype to `local`. We can only mark
             // `local` as reusable if we have an exact type match.
             && self.local_decls[local].ty == rvalue_ty
@@ -1932,10 +1980,6 @@ impl<'tcx> MutVisitor<'tcx> for VnState<'_, '_, 'tcx> {
                 let opaque = self.new_opaque(ty);
                 self.assign(local, opaque);
             }
-        }
-        // Terminators that can write to memory may invalidate (nested) derefs.
-        if terminator.kind.can_write_to_memory() {
-            self.invalidate_derefs();
         }
         self.super_terminator(terminator, location);
     }
